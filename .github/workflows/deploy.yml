@@ -117,11 +117,10 @@ jobs:
           rm -rf .git
           status=0
           cli_log="${RUNNER_TEMP}/vercel-cli.log"
-          result=$(vercel deploy --prod --yes --json \
-            --meta "deploySha=${HEAD_SHA}" 2>"$cli_log") || status=$?
-          inspector=$(jq -r '.deployment.inspectorUrl // empty' <<<"$result" 2>/dev/null || true)
-          url=$(jq -r '.deployment.url // empty' <<<"$result" 2>/dev/null || true)
-          if [[ "$status" != "0" || -z "$url" ]]; then
+          url=$(vercel deploy --prod --yes --meta "deploySha=${HEAD_SHA}" 2>"$cli_log") || status=$?
+          url=$(tail -n 1 <<<"$url")
+          if [[ "$status" != "0" || ! "$url" =~ ^https://[a-z0-9.-]+\.vercel\.app$ ]]; then
+            inspector=$(grep -oE "https://vercel\.com/[^ ]+" "$cli_log" | head -n 1 || true)
             if [[ -z "$inspector" ]]; then
               echo "Vercel CLI output before any deployment was created:"
               grep -iE "error|denied|forbidden|not found|invalid|token|scope" "$cli_log" | tail -n 20 || true
