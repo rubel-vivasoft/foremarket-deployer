@@ -101,6 +101,10 @@ jobs:
           persist-credentials: false
           path: source
 
+      - name: Install Vercel CLI
+        if: steps.decide.outputs.deploy == 'true' && !inputs.dry_run
+        run: npm install --global --no-fund --no-audit "${VERCEL_CLI}"
+
       - name: Deploy to production
         id: deploy
         if: steps.decide.outputs.deploy == 'true' && !inputs.dry_run
@@ -113,7 +117,7 @@ jobs:
           rm -rf .git
           status=0
           cli_log="${RUNNER_TEMP}/vercel-cli.log"
-          result=$(npx --yes "${VERCEL_CLI}" deploy --prod --yes --json \
+          result=$(vercel deploy --prod --yes --json \
             --meta "deploySha=${HEAD_SHA}" 2>"$cli_log") || status=$?
           inspector=$(jq -r '.deployment.inspectorUrl // empty' <<<"$result" 2>/dev/null || true)
           url=$(jq -r '.deployment.url // empty' <<<"$result" 2>/dev/null || true)
