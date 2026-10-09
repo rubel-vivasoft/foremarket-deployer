@@ -112,12 +112,17 @@ jobs:
           set -euo pipefail
           rm -rf .git
           status=0
+          cli_log="${RUNNER_TEMP}/vercel-cli.log"
           result=$(npx --yes "${VERCEL_CLI}" deploy --prod --yes --json \
-            --meta "deploySha=${HEAD_SHA}" 2>/dev/null) || status=$?
+            --meta "deploySha=${HEAD_SHA}" 2>"$cli_log") || status=$?
           inspector=$(jq -r '.deployment.inspectorUrl // empty' <<<"$result" 2>/dev/null || true)
           url=$(jq -r '.deployment.url // empty' <<<"$result" 2>/dev/null || true)
           if [[ "$status" != "0" || -z "$url" ]]; then
-            echo "::error::Vercel deploy of ${HEAD_SHA:0:7} failed (exit ${status}). Build log: ${inspector:-see the Vercel dashboard}"
+            if [[ -z "$inspector" ]]; then
+              echo "Vercel CLI output before any deployment was created:"
+              grep -iE "error|denied|forbidden|not found|invalid|token|scope" "$cli_log" | tail -n 20 || true
+            fi
+            echo "::error::Vercel deploy of ${HEAD_SHA:0:7} failed (exit ${status}). Build log: ${inspector:-no deployment was created}"
             exit 1
           fi
           echo "url=${url}" >> "$GITHUB_OUTPUT"
