@@ -1,0 +1,140 @@
+name: deploy
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Deploy even if production already runs the staging head
+        type: boolean
+        default: false
+      dry_run:
+        description: Only report the decision, never deploy
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+env:
+  SOURCE_REPO: Foremarket/foremarket-web
+  SOURCE_BRANCH: staging
+  PRODUCTION_DOMAIN: foremarket-web.vercel.app
+  VERCEL_CLI: vercel@63.1.0
+  VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+  VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Read staging head
+        id: head
+        env:
+          SOURCE_REPO_TOKEN: ${{ secrets.SOURCE_REPO_TOKEN }}
+        run: |
+          set -euo pipefail
+          sha=$(curl --silent --show-error --fail --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${SOURCE_REPO_TOKEN}" \
+            -H "Accept: application/vnd.github.sha" \
+            "https://api.github.com/repos/${SOURCE_REPO}/commits/heads/${SOURCE_BRANCH}")
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Unexpected response for the ${SOURCE_BRANCH} head"
+            exit 1
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "staging head: ${sha:0:7}"
+
+      - name: Compare with production
+        id: decide
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          latest=$(curl --silent --show-error --fail --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v6/deployments?projectId=${VERCEL_PROJECT_ID}&teamId=${VERCEL_ORG_ID}&target=production&limit=1")
+          count=$(jq '.deployments | length' <<<"$latest")
+          current=$(jq -r '.deployments[0].meta.deploySha // .deployments[0].meta.gitCommitSha // ""' <<<"$latest")
+          state=$(jq -r '.deployments[0].state // .deployments[0].readyState // "NONE"' <<<"$latest")
+          dirty=$(jq -r '.deployments[0].meta.gitDirty // "0"' <<<"$latest")
+
+          if [[ "$FORCE" == "true" ]]; then
+            reason="forced"
+          elif [[ "$count" == "0" ]]; then
+            reason="no production deployment"
+          elif [[ "$current" != "$HEAD_SHA" ]]; then
+            reason="production runs ${current:0:7}"
+          elif [[ "$dirty" == "1" ]]; then
+            reason="production was built from uncommitted changes"
+          else
+            reason=""
+          fi
+
+          echo "production: ${current:0:7} (${state})"
+          if [[ -z "$reason" ]]; then
+            echo "up to date"
+            echo "deploy=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy ${HEAD_SHA:0:7}: ${reason}"
+            echo "deploy=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check out staging head
+        if: steps.decide.outputs.deploy == 'true' && !inputs.dry_run
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ steps.head.outputs.sha }}
+          token: ${{ secrets.SOURCE_REPO_TOKEN }}
+          fetch-depth: 1
+          persist-credentials: false
+          path: source
+
+      - name: Deploy to production
+        id: deploy
+        if: steps.decide.outputs.deploy == 'true' && !inputs.dry_run
+        working-directory: source
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          HEAD_SHA: ${{ steps.head.outputs.sha }}
+        run: |
+          set -euo pipefail
+          rm -rf .git
+          status=0
+          result=$(npx --yes "${VERCEL_CLI}" deploy --prod --yes --json \
+            --meta "deploySha=${HEAD_SHA}" 2>/dev/null) || status=$?
+          inspector=$(jq -r '.deployment.inspectorUrl // empty' <<<"$result" 2>/dev/null || true)
+          url=$(jq -r '.deployment.url // empty' <<<"$result" 2>/dev/null || true)
+          if [[ "$status" != "0" || -z "$url" ]]; then
+            echo "::error::Vercel deploy of ${HEAD_SHA:0:7} failed (exit ${status}). Build log: ${inspector:-see the Vercel dashboard}"
+            exit 1
+          fi
+          echo "url=${url}" >> "$GITHUB_OUTPUT"
+          echo "deployed ${HEAD_SHA:0:7}: ${url}"
+
+      - name: Verify production domain
+        if: steps.deploy.outputs.url != ''
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        run: |
+          set -euo pipefail
+          served=$(curl --silent --show-error --fail --retry 3 --retry-all-errors \
+            -H "Authorization: Bearer ${VERCEL_TOKEN}" \
+            "https://api.vercel.com/v13/deployments/${PRODUCTION_DOMAIN}?teamId=${VERCEL_ORG_ID}" | jq -r '.url')
+          if [[ "https://${served}" != "$DEPLOY_URL" ]]; then
+            echo "::error::${PRODUCTION_DOMAIN} still serves ${served}, not the new deployment (rollback active?)"
+            exit 1
+          fi
+          echo "${PRODUCTION_DOMAIN} serves the new deployment"
